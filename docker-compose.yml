@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   telegram-mcp:
     build:
@@ -18,7 +16,7 @@ services:
       MCP_HOST: 0.0.0.0
     # The endpoint is unauthenticated — publish on localhost only.
     ports:
-      - "127.0.0.1:8765:8765"
+      - "127.0.0.1:8795:8765"
     # Optional: Uncomment the following lines to mount a local directory
     # for persisting the Telegram session file if NOT using TELEGRAM_SESSION_STRING.
     # Replace './telegram_sessions' with your desired host path.
