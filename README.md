@@ -57,7 +57,7 @@ The server currently includes 80+ MCP tools grouped into these areas:
 
 - **Accounts:** list configured accounts and route tool calls by account label.
 - **Chats and groups:** list chats, inspect metadata, create groups/channels, upgrade basic groups to supergroups, join or leave chats, invite or remove users, manage admins, bans, default permissions, slow mode, topics and their allowed icons, invite links, common chats, read receipts, and message links.
-- **Messages:** send, schedule, edit, delete, forward, pin, unpin, mark read, reply, search, inspect context, create polls, manage reactions, inspect inline buttons, and press inline callbacks. `send_message`, `reply_to_message`, and `edit_message` support classic formatting (`parse_mode='md'`/`'html'`) and server-side rich formatting (`parse_mode='rich'`/`'rich_markdown'`/`'rich_html'` — full Markdown/HTML with tables, headings, formulas, and collapsible sections). Rich modes require Telegram Premium on the account; Premium is re-checked on every call, and without it nothing is sent — the tool returns a structured `telegram_premium_required` result so the agent can reformat with classic modes and retry. `send_message`, `reply_to_message`, and `edit_message` also accept `format_date` to render a date as a tappable chip. `edit_message` reports an edit that changes nothing as `not modified` instead of an error.
+- **Messages:** send, schedule, edit, delete, forward, pin, unpin, mark read, reply, search, inspect context, create polls, manage reactions, inspect inline buttons, press inline callbacks, and export complete chat history or unread messages to structured JSON (export_chat_history, export_unread_messages). `send_message`, `reply_to_message`, and `edit_message` support classic formatting (`parse_mode='md'`/`'html'`) and server-side rich formatting (`parse_mode='rich'`/`'rich_markdown'`/`'rich_html'` — full Markdown/HTML with tables, headings, formulas, and collapsible sections). Rich modes require Telegram Premium on the account; Premium is re-checked on every call, and without it nothing is sent — the tool returns a structured `telegram_premium_required` result so the agent can reformat with classic modes and retry. `send_message`, `reply_to_message`, and `edit_message` also accept `format_date` to render a date as a tappable chip. `edit_message` reports an edit that changes nothing as `not modified` instead of an error.
 
 `list_inline_buttons` describes each button by row, column and `kind` (what pressing it does), for inline buttons and reply keyboards. `press_inline_button` presses `callback` and `game` buttons, returns the bot's answer with `alert` and `url`, and refuses buttons that need the 2FA password.
 
@@ -76,7 +76,7 @@ send_as)` saves which one your later messages use: `"me"` for your own account, 
 username of an allowed sender. The saved sender applies in all your Telegram clients.
 Anonymous posting as an admin is an admin right and is not changed by it.
 
-- **Contacts:** list, search, add, delete, block, unblock, import, export, inspect direct chats, find recent contact interactions, and remember contacts by the names you actually use (see below).
+- **Contacts:** list, search, add, delete, block, unblock, import, export, look up a phone number without adding a contact, inspect direct chats, find recent contact interactions, and remember contacts by the names you actually use (see below).
 
 ### Typing indicators
 
@@ -92,6 +92,24 @@ the typing phase has a 50-second timeout and cleanup a separate three-second tim
 A failed cleanup is reported explicitly. Successful RPC responses confirm Telegram accepted
 the requests, not that another client's UI displayed them. This is a write operation and
 respects the existing account routing and chat allowlist.
+
+### Phone lookups
+
+`resolve_phone(phone)` finds the Telegram user behind a phone number without adding them to your contacts, and returns the same raw result as `resolve_username`. Pass the number in E.164 form: a leading `+` and the country code, 7 to 15 digits in total. Spaces, dashes, dots and parentheses are ignored. Local forms such as `8 999 000-11-22` or `0044 ...` are rejected before Telegram is called, because the country would have to be guessed. Telegram only answers when the owner's privacy settings let you find them by number. With several accounts configured, `account` is required, since each lookup spends that account's quota.
+
+On a FloodWait the tool returns the wait and does not retry. Telethon ignores a per-request sleep threshold, so the tool sets the client's `flood_sleep_threshold` to 0 and restores it when the lookup returns. The 0 holds for as long as the lookup takes, including Telethon's own resends: any other request on that account that gets a FloodWait in that window raises it instead of sleeping.
+
+`resolve_phone` is read-only, so it is part of `TELEGRAM_EXPOSED_TOOLS=read-only`. To hide it, exclude it by name, e.g. `TELEGRAM_EXPOSED_TOOLS=read-only-resolve_phone`.
+
+Telegram publishes no quota for phone lookups and answers bulk lookups with long FloodWaits, so you can cap them locally. Both limits are off unless set. Every lookup admitted past local validation counts, whatever happens next: a Telegram answer or error, a FloodWait raised by Telethon's local pre-check without sending, or a call cancelled while it waits for another lookup on the same account. That errs on the side of refusing. Numbers rejected locally do not count. Telethon may resend a lookup itself after a server error, timeout or DC migration; that still counts once. A refused call sends nothing and says how many seconds to wait.
+
+```env
+TELEGRAM_RESOLVE_PHONE_MAX_PER_DAY=12              # lookups per rolling 24 hours (0 or unset = no cap)
+TELEGRAM_RESOLVE_PHONE_MIN_INTERVAL_SECONDS=5      # minimum gap between lookups (0 or unset = none)
+TELEGRAM_RESOLVE_PHONE_STATE_FILE=/path/to/resolve-phone.json  # keep the count across restarts
+```
+
+Without a state file the count lives in memory and restarts from zero with the server. The state file holds only lookup timestamps (owner-only, written atomically), is shared by every server process that points at it, and covers all accounts together. A `<state file>.lock` file next to it serialises those processes. If it exists but cannot be parsed, lookups are refused until you fix or delete it; deleting it resets the count. A malformed limit value also refuses lookups instead of running unlimited. The history keeps only the newest `max(MAX_PER_DAY, 1)` timestamps, so after raising the cap the first window counts only the lookups that were kept.
 
 ### Remembered contacts
 
@@ -519,12 +537,18 @@ For `http` and `sse`, the server binds `MCP_HOST`:`MCP_PORT` (default
 `127.0.0.1:8765`); the streamable HTTP endpoint is `/mcp`, the SSE endpoint is
 `/sse`.
 
+Host and Origin validation is always on for `http` and `sse`, so a web page
+open in your browser cannot send tool calls to the local server (cross-origin
+request forgery / DNS rebinding). By default only `127.0.0.1`, `localhost` and
+`[::1]` Host headers are accepted, and only browser pages served from those
+hosts; requests without an `Origin` header (regular MCP clients) are not
+affected. CORS preflights echo only an allowed origin, never `*`.
+
 If the server is reachable via a domain (e.g. behind a reverse proxy) rather
-than only `127.0.0.1`/`localhost`, set `MCP_ALLOWED_HOSTS` (and optionally
-`MCP_ALLOWED_ORIGINS`) to enable DNS-rebinding protection and allow that Host
-header, e.g. `MCP_ALLOWED_HOSTS=mcp.example.com`. Comma-separated; supports a
-`:*` suffix to allow any port. Left unset, DNS-rebinding protection stays off
-(the historical default).
+than only `127.0.0.1`/`localhost`, set `MCP_ALLOWED_HOSTS` to the Host headers
+to accept, e.g. `MCP_ALLOWED_HOSTS=mcp.example.com`, and `MCP_ALLOWED_ORIGINS`
+to any browser origins that may call the server. Each replaces the local
+default list. Comma-separated; supports a `:*` suffix to allow any port.
 
 Prefer `http` when more than one MCP client (or many coding-agent sessions)
 will use the server: a single long-lived process holds one Telegram
@@ -640,6 +664,8 @@ These optional variables control how the client appears in Telegram under
 TELEGRAM_DEVICE_MODEL=Telegram MCP
 TELEGRAM_SYSTEM_VERSION=1.0
 TELEGRAM_APP_VERSION=1.0
+TELEGRAM_LANG_CODE=en
+TELEGRAM_SYSTEM_LANG_CODE=en
 ```
 
 If left unset, Telethon falls back to the host platform (for example `arm64`).
@@ -739,6 +765,26 @@ Security behavior:
   and `upload_file` have no extension limit by default; see
   `TELEGRAM_FILE_EXTENSIONS` above to add one.
 
+#### Clients on another machine
+
+File-path tools read and write the server's disk. When the server runs over
+HTTP for a client on another machine, set `TELEGRAM_MEDIA_BASE_URL` to the URL
+clients reach it at (for example `https://tg.example.com`, behind your reverse
+proxy) and configure a server allowed root:
+
+- `download_media` also returns a URL that serves the downloaded file
+  (`<base>/media/…`); fetch it with `curl` or similar.
+- `prepare_upload(filename)` returns a `url` and a `file_path`. PUT the file to
+  the url (`curl --fail -T ./report.pdf "<url>"`; streamed to disk, up to the
+  `send_file` size limit), then pass `file_path` to `send_file`, `send_album`,
+  `send_voice` or `send_sticker`.
+
+Both URLs carry an HMAC signature and stay inside the first server allowed root.
+Each expires after an hour or when the server restarts, and an upload URL takes
+one upload. Uploads land in `<first_root>/uploads/` and are deleted two hours
+later. Client MCP Roots name the client's own disk, so such a deployment
+usually also sets `TELEGRAM_SERVER_ROOTS_ONLY=1`.
+
 Run with allowed roots via environment variable:
 
 ```bash
@@ -782,9 +828,11 @@ From an MCP client configuration, you can pass roots via `env` or as arguments a
 To restrict AI agents or MCP clients to specific chats only (preventing access to all private or corporate conversations), configure `TELEGRAM_ALLOWED_CHAT_IDS`:
 
 ```env
-# Comma-separated list of allowed chat IDs, supergroup IDs, or usernames
-TELEGRAM_ALLOWED_CHAT_IDS=12345678,-100123456789,@allowed_channel
+# Comma-separated list of allowed chat IDs (marked form) or usernames
+TELEGRAM_ALLOWED_CHAT_IDS=12345678,-100123456789,-4567,@allowed_channel
 ```
+
+Numeric IDs are matched exactly in Telegram's marked form, the same `chat_id` the tools return: a user is `12345678`, a basic group `-4567`, a channel or supergroup `-100123456789`. Users, basic groups and channels have separate ID namespaces, so the same bare number can be three unrelated chats; an entry is never widened to another type (allowing channel `-100123456789` does not allow user `123456789`). Write groups and channels with their `-`/`-100` prefix: a bare positive number only ever means a user.
 
 When `TELEGRAM_ALLOWED_CHAT_IDS` is set:
 - **`list_chats` / `get_chats`:** Only chats matching the allowlist are returned; all other conversations remain completely invisible to the agent.
@@ -795,7 +843,27 @@ When `TELEGRAM_ALLOWED_CHAT_IDS` is set:
 
 If `TELEGRAM_ALLOWED_CHAT_IDS` is unset or empty, the server operates in unrestricted mode (default), preserving 100% backward compatibility.
 
+## Deletion Audit Log (Recent Actions for Private Chats)
+
+To maintain an immutable, local audit trail for destructive actions (e.g. tracking when and how messages were deleted without exposing message text), the server writes an append-only JSONL log (closes #321):
+
+```env
+# Optional custom path for the deletion audit log (defaults to telegram_audit.log next to the server)
+TELEGRAM_AUDIT_LOG=/path/to/telegram_audit.log
+```
+
+- **Operations logged:** `delete_message`, `delete_messages_bulk`, and `delete_chat_history`.
+- **Refusals and errors logged:** Refused cross-chat deletion attempts (attempting to delete IDs outside the target chat) and permission errors (`ChatAdminRequiredError`) are recorded with full diagnostic details.
+- **Privacy preservation:** Only operation metadata is persisted (`timestamp`, `account`, `tool`, `chat_id`, `message_ids`, `revoke`, `outcome`). Message content and bodies are **never** logged.
+- **Log entry format (JSONL):**
+  ```json
+  {"timestamp": "2026-11-07T18:25:00.123456+00:00", "account": "work", "tool": "delete_message", "chat_id": 12345678, "message_ids": [42], "revoke": null, "outcome": "deleted"}
+  {"timestamp": "2026-11-07T18:25:05.123456+00:00", "account": "work", "tool": "delete_messages_bulk", "chat_id": 12345678, "message_ids": [999], "revoke": true, "outcome": "refused: foreign message IDs [999]"}
+  ```
+
 ## Docker
+
+For complete compose templates and client configurations (Claude Desktop, Cursor, etc.), see the [**Docker Deployment Guide**](examples/docker/README.md).
 
 Build the image:
 
