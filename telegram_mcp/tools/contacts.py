@@ -29,6 +29,8 @@ async def list_contacts(account: Optional[str] = None) -> str:
             return "No contacts found."
         records = []
         for user in users:
+            if not is_chat_allowed(get_marked_id(user), user):
+                continue
             name = person_name(user)
             record = {
                 "id": user.id,
@@ -80,8 +82,20 @@ async def search_contacts(query: str, account: Optional[str] = None) -> str:
         users = result.users
         if not users and not alias_records:
             return f"No contacts found matching '{query}'."
-        records = alias_records
+        records = []
+        has_blocked_usernames = any(isinstance(item, str) for item in get_blocked_chat_ids())
+        for record in alias_records:
+            entity = None
+            if has_blocked_usernames:
+                try:
+                    entity = await resolve_entity(record["id"], cl)
+                except Exception:
+                    pass
+            if is_chat_allowed(record["id"], entity):
+                records.append(record)
         for user in users:
+            if not is_chat_allowed(get_marked_id(user), user):
+                continue
             name = person_name(user)
             record = {
                 "id": user.id,
@@ -113,7 +127,18 @@ async def get_contact_ids(account: Optional[str] = None) -> str:
         result = await cl(functions.contacts.GetContactIDsRequest(hash=0))
         if not result:
             return "No contact IDs found."
-        return "Contact IDs: " + ", ".join(str(cid) for cid in result)
+        visible = []
+        has_blocked_usernames = any(isinstance(item, str) for item in get_blocked_chat_ids())
+        for cid in result:
+            entity = None
+            if has_blocked_usernames:
+                try:
+                    entity = await resolve_entity(cid, cl)
+                except Exception:
+                    pass
+            if is_chat_allowed(cid, entity):
+                visible.append(str(cid))
+        return "Contact IDs: " + ", ".join(visible) if visible else "No contact IDs found."
     except Exception as e:
         return log_and_format_error("get_contact_ids", e)
 
@@ -153,7 +178,7 @@ async def get_direct_chat_by_contact(contact_query: str, account: Optional[str] 
                 or (phone and contact_query in phone)
             ):
                 found_contacts.append(contact)
-        if is_chat_allowlist_enabled():
+        if is_chat_allowlist_enabled() or is_chat_blocklist_enabled():
             found_contacts = [c for c in found_contacts if is_chat_allowed(get_marked_id(c), c)]
         if not found_contacts:
             return f"No contacts found matching '{contact_query}'."
@@ -230,7 +255,9 @@ async def get_contact_chats(contact_id: Union[int, str], account: Optional[str] 
         try:
             common = await cl.get_common_chats(contact)
             for chat in common:
-                if is_chat_allowlist_enabled() and not is_chat_allowed(get_marked_id(chat), chat):
+                if (
+                    is_chat_allowlist_enabled() or is_chat_blocklist_enabled()
+                ) and not is_chat_allowed(get_marked_id(chat), chat):
                     continue
                 records.append(
                     {
@@ -267,6 +294,9 @@ async def get_last_interaction(contact_id: Union[int, str], account: Optional[st
     """
     Get the most recent message with a contact.
 
+    Records include links when present: {text, url} for text links and
+    explicit URLs, {text, user_id} for mentions of users without a username.
+
     Args:
         contact_id: The ID or username of the contact.
 
@@ -295,6 +325,7 @@ async def get_last_interaction(contact_id: Union[int, str], account: Optional[st
                     "date": msg.date,
                     "from": "You" if msg.out else contact_name,
                     "text": sanitize_user_content(msg.message),
+                    **get_link_metadata(msg),
                 }
             )
 
@@ -333,7 +364,7 @@ def normalize_phone(phone: str) -> Optional[str]:
 @mcp.tool(
     annotations=ToolAnnotations(title="Resolve Phone", openWorldHint=True, readOnlyHint=True)
 )
-@with_account(readonly=False)
+@with_account(readonly=False, returns_chat_data=True)
 async def resolve_phone(phone: str, account: Optional[str] = None) -> str:
     """
     Resolve a phone number to the Telegram user who owns it, without adding a contact.
@@ -371,6 +402,11 @@ async def resolve_phone(phone: str, account: Optional[str] = None) -> str:
                 result = await cl(functions.contacts.ResolvePhoneRequest(phone=digits))
             finally:
                 cl.flood_sleep_threshold = previous_threshold
+        if is_chat_allowlist_enabled() or is_chat_blocklist_enabled():
+            entities = [*getattr(result, "users", []), *getattr(result, "chats", [])]
+            for entity in entities:
+                if not is_chat_allowed(get_marked_id(entity), entity):
+                    return "No contact found."
         return str(result)
     except PhoneNotOccupiedError:
         return (
@@ -554,6 +590,7 @@ async def delete_contact(user_id: Union[int, str], account: Optional[str] = None
 )
 @with_account(readonly=False)
 @validate_id("user_id")
+@flood_category("admin_action")
 async def block_user(user_id: Union[int, str], account: Optional[str] = None) -> str:
     """
     Block a user by user ID.
@@ -576,6 +613,7 @@ async def block_user(user_id: Union[int, str], account: Optional[str] = None) ->
 )
 @with_account(readonly=False)
 @validate_id("user_id")
+@flood_category("admin_action")
 async def unblock_user(user_id: Union[int, str], account: Optional[str] = None) -> str:
     """
     Unblock a user by user ID.
@@ -661,6 +699,7 @@ async def get_blocked_users(account: Optional[str] = None) -> str:
 )
 @with_account(readonly=False)
 @validate_id("chat_id")
+@flood_category("send")
 async def send_contact(
     chat_id: Union[int, str],
     phone_number: str,
@@ -785,6 +824,10 @@ async def set_contact_alias(
                 }
             )
         marked_id = get_marked_id(entity)
+        if (is_chat_allowlist_enabled() or is_chat_blocklist_enabled()) and not is_chat_allowed(
+            target, entity
+        ):
+            return check_chat_access(target, entity)
         formatted = format_entity(entity)
 
         def _store(aliases):
@@ -807,6 +850,8 @@ async def set_contact_alias(
                 "name": formatted.get("name"),
                 "account": account or "default",
             }
+            if is_chat_blocked(marked_id, entity):
+                return format_tool_result({"saved": True, "alias": key})
             return format_tool_result({"saved": True, "alias": key, "resolved": formatted})
 
         return update_aliases(_store)

@@ -9,6 +9,8 @@ import sqlite3
 import logging
 import mimetypes
 import unicodedata
+import inspect
+from contextvars import ContextVar
 
 # Ensure sys.stderr is reconfigured for UTF-8 on Windows where possible
 if hasattr(sys.stderr, "reconfigure"):
@@ -17,6 +19,7 @@ if hasattr(sys.stderr, "reconfigure"):
     except Exception:
         pass
 from contextlib import contextmanager
+from contextvars import ContextVar
 from difflib import SequenceMatcher
 from datetime import datetime, timedelta, timezone
 from enum import Enum
@@ -68,6 +71,12 @@ except ImportError:  # pragma: no cover - Windows fallback
     fcntl = None
 
 from telegram_mcp.account_labels import canonical_account_label
+from telegram_mcp.floodgate import (
+    FloodCircuitBreaker,
+    RateLimitSpec,
+    TelegramOperationSuspendedError,
+    TelegramRateLimitGate,
+)
 from telegram_mcp.singleton import try_lock_exclusive
 
 from functools import wraps
@@ -895,7 +904,175 @@ def is_multi_mode() -> bool:
     return len(clients) > 1
 
 
-def with_account(readonly=False):
+_chat_policy_targets: ContextVar = ContextVar("chat_policy_targets", default=())
+_chat_policy_action: ContextVar = ContextVar("chat_policy_action", default=None)
+
+
+# --- Flood prevention (vendored telethon-floodgate, MIT) ----------------------
+# A proactive sliding-window gate per (account, category) checked BEFORE the
+# RPC, plus a reactive circuit breaker per (tool, account) fed by real
+# FloodWaitErrors. On a deferral the tool returns a rate-limit string instead
+# of making the call — an agent reschedules, the account stays out of the
+# multi-hour-ban zone. Disable with TELEGRAM_FLOODGATE=0. Vendored from
+# https://github.com/axisrow/telethon-floodgate (see telegram_mcp/floodgate/).
+
+_floodgate_gate: Optional[TelegramRateLimitGate] = None
+_floodgate_breaker: Optional[FloodCircuitBreaker] = None
+
+# The with_account wrapper knows the account label; log_and_format_error (the
+# only place a real FloodWaitError surfaces) does not — the contextvar bridges
+# that without touching any of the ~140 tool call sites.
+_CURRENT_ACCOUNT: ContextVar[Optional[str]] = ContextVar("current_account", default=None)
+# Set by _floodgate_report_flood when THIS completion hit a real FloodWait;
+# consumed (and cleared) by _floodgate_settle. Sniffing result text instead
+# wedged the breaker on successful calls whose output merely quoted the
+# FloodWait reply prefix.
+_FLOOD_SEEN: ContextVar[bool] = ContextVar("floodgate_flood_seen", default=False)
+
+# Prefix of the reply log_and_format_error returns for a real FloodWaitError;
+# the wrapper uses it to tell flooded results from working ones.
+_FLOOD_WAIT_REPLY_PREFIX = "Rate limit exceeded (FloodWait)"
+
+
+def _get_floodgate_enabled() -> bool:
+    """Read TELEGRAM_FLOODGATE from environment (default: on; 0/false/no/off disables)."""
+    raw = os.getenv("TELEGRAM_FLOODGATE", "1").strip().lower()
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    if raw in {"", "1", "true", "yes", "on"}:
+        return True
+    logger.warning("Invalid TELEGRAM_FLOODGATE value; keeping the floodgate enabled")
+    return True
+
+
+def _floodgate():
+    """Lazily build the shared gate+breaker pair (module globals so tests can patch)."""
+    global _floodgate_gate, _floodgate_breaker
+    if _floodgate_gate is None or _floodgate_breaker is None:
+        # resolve is a deliberate no-op category in the vendored gate (upstream
+        # owns live resolution elsewhere), so username resolution gets its own
+        # bucket at the calibrated 20/60s (auth.resolveUsername escalates to
+        # 15-18h bans; see telegram_mcp/floodgate/rate_limiter.py).
+        _floodgate_gate = TelegramRateLimitGate(
+            category_limits={"resolve_guard": RateLimitSpec(max_calls=20, window_sec=60.0)}
+        )
+        _floodgate_breaker = FloodCircuitBreaker()
+    return _floodgate_gate, _floodgate_breaker
+
+
+def _floodgate_defer(tool_name: str, account: Optional[str]) -> Optional[tuple[float, bool]]:
+    """Seconds the local floodgate defers this tool call, or None to proceed.
+
+    The bool separates a breaker suspension from a gate deferral: a suspension
+    granted nothing, so the caller must not settle the pair as a success —
+    that would close an OPEN breaker after a single refusal.
+
+    Never raises: a broken gate must never take a tool down.
+    """
+    if not _get_floodgate_enabled():
+        return None
+    try:
+        gate, breaker = _floodgate()
+        label = canonical_account_label(account)
+        # The breaker refuses first (no slots burned while suspended), then the
+        # proactive window reserves the slot.
+        breaker.check(tool_name, label)
+        wait = gate.try_acquire(label, category_for_tool(tool_name))
+        return (wait, False) if wait else None
+    except TelegramOperationSuspendedError as exc:
+        # Suspended by the breaker: the pair sits out its cooldown.
+        defer_seconds = exc.retry_after_sec
+        return defer_seconds, True
+    except Exception:
+        logger.warning("Floodgate check failed; letting the tool call through.")
+        return None
+
+
+def _floodgate_rate_limited_message(tool_name: str, retry_after: float) -> str:
+    """Rate-limit string in the exact shape the FloodWait branch of
+    log_and_format_error uses — it is the instruction agents already honor."""
+    wait_clause = (
+        f"{retry_after:.0f} seconds" if retry_after < 90 else f"{retry_after / 60:.1f} minutes"
+    )
+    # Same stable-code recipe as log_and_format_error, own FLOODGATE prefix.
+    error_code = f"FLOODGATE-ERR-{zlib.crc32(tool_name.encode()) % 1000:03d}"
+    return (
+        f"Rate limit exceeded (FloodGate): local pacing requires waiting {wait_clause} "
+        f"before repeating {tool_name}. Do NOT retry immediately (code: {error_code})."
+    )
+
+
+def _floodgate_report_flood(tool_name: str, seconds: float) -> None:
+    """Feed a real FloodWaitError into the gate backoff and the breaker."""
+    # Flag this completion before any guard: settle must treat the
+    # FloodWait-shaped reply as a flood, never as a success.
+    _FLOOD_SEEN.set(True)
+    if not _get_floodgate_enabled():
+        return
+    label = _CURRENT_ACCOUNT.get()
+    if not label:
+        return
+    try:
+        gate, breaker = _floodgate()
+        gate.note_flood(label, seconds)  # inert unless flood_backoff is enabled
+        breaker.record_flood(tool_name, label)
+    except Exception:
+        pass
+
+
+def _floodgate_settle(tool_name: str, label: Optional[str], result: Any) -> None:
+    """Resolve a pending breaker trial after a tool call.
+
+    A completion flagged by _floodgate_report_flood keeps the flood
+    log_and_format_error already recorded; every other completion — errors
+    that are not floods included, and gate deferrals that made no call —
+    releases the trial, so a granted probe can never wedge the pair.
+    Completions that made no RPC at all (validation rejections, allowlist
+    denials) are indistinguishable from successes at this boundary and reset
+    the consecutive-flood count — the same success-clears-counter rule the
+    vendored engine ships.
+    """
+    flooded = _FLOOD_SEEN.get()
+    _FLOOD_SEEN.set(False)
+    if not label or not _get_floodgate_enabled():
+        return
+    if flooded:
+        return
+    try:
+        _, breaker = _floodgate()
+        breaker.record_success(tool_name, label)
+    except Exception:
+        pass
+
+
+# Tool name -> gate category, populated at import time by @flood_category on
+# the tool definitions themselves (telegram_mcp/tools/*): the mapping lives
+# next to each tool and cannot drift from it. Undecorated tools take the
+# broad "default" bucket (1000/60s) — reads, media, contacts, profile,
+# folders, waits.
+TOOL_CATEGORIES: dict[str, str] = {}
+
+
+def flood_category(category: str):
+    """Declare an MCP tool's floodgate category, e.g. ``@flood_category("send")``.
+
+    Stacked on the tool definitions alongside @with_account; registration is
+    keyed by the tool function name — the same name _floodgate_defer sees.
+    """
+
+    def decorator(fn):
+        TOOL_CATEGORIES[fn.__name__] = category
+        return fn
+
+    return decorator
+
+
+def category_for_tool(tool_name: str) -> str:
+    """Gate category for a tool name; unknown tools take the default bucket."""
+    return TOOL_CATEGORIES.get(tool_name, "default")
+
+
+def with_account(readonly=False, *, returns_chat_data=False):
     """Decorator that adds multi-account support to MCP tools.
 
     - In single-mode: always uses the sole client, no output tagging.
@@ -908,47 +1085,108 @@ def with_account(readonly=False):
 
     The wrapped function must accept ``account: str = None`` and use
     ``get_client(account)`` internally to obtain the TelegramClient.
+    Set ``returns_chat_data`` for read tools that require an explicit account.
     """
 
     def decorator(fn):
         @wraps(fn)
         async def wrapper(*args, **kwargs):
-            account = kwargs.get("account")
+            redaction = None if readonly or returns_chat_data else [False]
+            token = _chat_policy_action.set(redaction)
+            try:
+                account = kwargs.get("account")
 
-            # Explicit account OR single-mode -> call once
-            if account is not None or not is_multi_mode():
-                return await fn(*args, **kwargs)
+                # Gate the logical call before any client work: in single-mode the
+                # sole label stands in for a missing account argument. In the
+                # multi-mode fan-out path the label is only known per account, so
+                # the top-level check is skipped (_call_for gates each label).
+                # The canonical label is what every gate/breaker/state key uses.
+                gate_label = None
+                if account is not None:
+                    gate_label = canonical_account_label(account)
+                elif not is_multi_mode() and clients:
+                    gate_label = next(iter(clients))
+                defer = _floodgate_defer(fn.__name__, gate_label) if gate_label else None
+                if defer is not None:
+                    seconds, suspended = defer
+                    logger.warning("Floodgate defers the tool call; returning a rate-limit reply.")
+                    if not suspended:
+                        # No call was made: release a breaker trial this check granted.
+                        _floodgate_settle(fn.__name__, gate_label, "")
+                    return _floodgate_rate_limited_message(fn.__name__, seconds)
 
-            # account is None AND multi-mode
-            if not readonly:
-                labels = ", ".join(clients.keys())
-                return f"Error: 'account' is required. Available accounts: {labels}"
-
-            # Read-only fan-out to all accounts concurrently
-            async def _call_for(label):
-                kw = dict(kwargs)
-                kw["account"] = label
+                account_token = _CURRENT_ACCOUNT.set(gate_label)
                 try:
-                    result = await fn(*args, **kw)
-                    failed = False
-                except ToolError as error:
-                    result = str(error)
-                    failed = True
-                return label, result, failed
+                    # Explicit account OR single-mode -> call once
+                    if account is not None or not is_multi_mode():
+                        result = None
+                        try:
+                            result = await fn(*args, **kwargs)
+                            if redaction and redaction[0]:
+                                return "Action response omitted because the chat is blocklisted."
+                            return result
+                        finally:
+                            _floodgate_settle(fn.__name__, gate_label, result)
 
-            results = await asyncio.gather(*(_call_for(label) for label in clients))
-            if all(failed for _, _, failed in results):
-                raise ToolError(
-                    "\n\n".join(f"[{label}]\n{result}" for label, result, _ in results)
-                )
-            if all(isinstance(result, str) for _, result, _ in results):
-                return "\n\n".join(f"[{label}]\n{result}" for label, result, _ in results)
+                    # account is None AND multi-mode
+                    if not readonly:
+                        labels = ", ".join(clients.keys())
+                        return f"Error: 'account' is required. Available accounts: {labels}"
 
-            account_labelled_content = []
-            for label, result, _ in results:
-                account_labelled_content.append(f"[{label}]")
-                account_labelled_content.extend(result if isinstance(result, list) else [result])
-            return account_labelled_content
+                    # Read-only fan-out to all accounts concurrently
+                    async def _call_for(label):
+                        kw = dict(kwargs)
+                        kw["account"] = label
+                        inner_account_token = _CURRENT_ACCOUNT.set(label)
+                        try:
+                            per_account_defer = _floodgate_defer(fn.__name__, label)
+                            if per_account_defer is not None:
+                                seconds, suspended = per_account_defer
+                                logger.warning(
+                                    "Floodgate defers the tool call for one account; "
+                                    "returning a rate-limit reply."
+                                )
+                                # Not failed: pacing is not an error, and a deferral
+                                # on every account must not raise a ToolError.
+                                if not suspended:
+                                    _floodgate_settle(fn.__name__, label, "")
+                                return (
+                                    label,
+                                    _floodgate_rate_limited_message(fn.__name__, seconds),
+                                    False,
+                                )
+                            result = None
+                            try:
+                                result = await fn(*args, **kw)
+                                failed = False
+                            except ToolError as error:
+                                result = str(error)
+                                failed = True
+                            finally:
+                                _floodgate_settle(fn.__name__, label, result)
+                            return label, result, failed
+                        finally:
+                            _CURRENT_ACCOUNT.reset(inner_account_token)
+
+                    results = await asyncio.gather(*(_call_for(label) for label in clients))
+                    if all(failed for _, _, failed in results):
+                        raise ToolError(
+                            "\n\n".join(f"[{label}]\n{result}" for label, result, _ in results)
+                        )
+                    if all(isinstance(result, str) for _, result, _ in results):
+                        return "\n\n".join(f"[{label}]\n{result}" for label, result, _ in results)
+
+                    account_labelled_content = []
+                    for label, result, _ in results:
+                        account_labelled_content.append(f"[{label}]")
+                        account_labelled_content.extend(
+                            result if isinstance(result, list) else [result]
+                        )
+                    return account_labelled_content
+                finally:
+                    _CURRENT_ACCOUNT.reset(account_token)
+            finally:
+                _chat_policy_action.reset(token)
 
         return wrapper
 
@@ -1000,6 +1238,11 @@ async def _force_reconnect(cl: TelegramClient):
             "outside the server (session_string_generator.py) and restart."
         )
     _last_conn_verified[id(cl)] = time.time()
+    # Telegram does not push again the updates that arrived while the connection was
+    # down, and a fresh connection gets no getDifference of its own: without this, a
+    # message received during the outage reaches the event handlers (incoming feed,
+    # wait_for_events) only after Telethon's 15-minute no-updates timeout, if at all.
+    await cl.catch_up()
     reconnect_logger.warning("Forced reconnect successful")
 
 
@@ -1125,6 +1368,7 @@ EXTENSION_ALLOWLISTS: dict[str, set[str]] = dict(_DEFAULT_EXTENSION_ALLOWLISTS)
 MAX_FILE_BYTES: dict[str, int] = {
     "download_media": 200 * 1024 * 1024,  # 200 MB
     "send_file": 200 * 1024 * 1024,  # 200 MB
+    "edit_message_media": 200 * 1024 * 1024,  # 200 MB
     "upload_file": 200 * 1024 * 1024,
     "send_voice": 100 * 1024 * 1024,
     "send_sticker": 10 * 1024 * 1024,
@@ -1158,10 +1402,23 @@ _NUMERIC_CHAT_ID_RE = re.compile(r"-?\d+")
 CHAT_PARAM_NAMES: frozenset[str] = frozenset(
     {"chat_id", "from_chat_id", "to_chat_id", "channel", "contact_id", "group_id"}
 )
+# "<chat>:<topic id>" in TELEGRAM_ALLOWED_CHAT_IDS allows a chat but only that forum
+# topic (1 is General). The chat part is written like a plain entry: marked ID or username.
+_TOPIC_ENTRY_RE = re.compile(r"(?P<chat>-?\d+|@?[A-Za-z0-9_]+)\s*:\s*(?P<topic>[1-9]\d*)")
+
+
+def _split_topic_entry(token: str) -> tuple[str, Optional[int]]:
+    """Split an allowlist token into its chat part and forum topic (None for a plain entry)."""
+    match = _TOPIC_ENTRY_RE.fullmatch(token)
+    if match is None:
+        return token, None
+    return match.group("chat"), int(match.group("topic"))
 
 
 def _parse_allowed_chat_ids(
     raw: Optional[Union[str, Iterable[Union[int, str]]]],
+    *,
+    allow_topics: bool = False,
 ) -> Optional[set[Union[int, str]]]:
     """Parse TELEGRAM_ALLOWED_CHAT_IDS into a set of allowed marked IDs and usernames.
 
@@ -1175,6 +1432,10 @@ def _parse_allowed_chat_ids(
     bare number can name unrelated chats of different types. Each entry is kept
     exactly as written and never widened to other peer types: allowing channel
     ``-100123456789`` must not also allow user ``123456789``.
+
+    With ``allow_topics`` a ``<chat>:<topic id>`` entry allows its chat here;
+    ``get_allowed_topics`` then limits that chat to the listed forum topics. The
+    blocklist parses without it, so such an entry never blocks a whole chat.
     """
     if raw is None:
         return None
@@ -1193,6 +1454,8 @@ def _parse_allowed_chat_ids(
 
     allowed: set[Union[int, str]] = set()
     for token in tokens:
+        if allow_topics:
+            token, _topic = _split_topic_entry(token)
         if _NUMERIC_CHAT_ID_RE.fullmatch(token):
             allowed.add(int(token))
             continue
@@ -1205,7 +1468,7 @@ def _parse_allowed_chat_ids(
 
 def _load_allowed_chat_ids() -> Optional[set[Union[int, str]]]:
     """Load ALLOWED_CHAT_IDS from the TELEGRAM_ALLOWED_CHAT_IDS environment variable."""
-    return _parse_allowed_chat_ids(os.getenv("TELEGRAM_ALLOWED_CHAT_IDS"))
+    return _parse_allowed_chat_ids(os.getenv("TELEGRAM_ALLOWED_CHAT_IDS"), allow_topics=True)
 
 
 # Initial load from environment
@@ -1216,7 +1479,7 @@ def get_effective_allowed_chat_ids() -> Optional[set[Union[int, str]]]:
     """Return the currently effective set of allowed chat IDs, or None if allowlist is disabled."""
     env_raw = os.getenv("TELEGRAM_ALLOWED_CHAT_IDS")
     if env_raw is not None:
-        return _parse_allowed_chat_ids(env_raw)
+        return _parse_allowed_chat_ids(env_raw, allow_topics=True)
     return ALLOWED_CHAT_IDS
 
 
@@ -1225,16 +1488,136 @@ def is_chat_allowlist_enabled() -> bool:
     return get_effective_allowed_chat_ids() is not None
 
 
+def _allowlist_chat_key(token: str) -> Optional[Union[int, str]]:
+    """An allowlist entry's chat part as matched: a marked ID or a lowercase username."""
+    if _NUMERIC_CHAT_ID_RE.fullmatch(token):
+        return int(token)
+    return token.lstrip("@").strip().lower() or None
+
+
+_TopicLimits = tuple[dict[Union[int, str], frozenset[int]], frozenset[Union[int, str]]]
+
+
+def _parse_allowed_topics(raw: Optional[str]) -> _TopicLimits:
+    """Forum topic limits from the ``<chat>:<topic id>`` entries of TELEGRAM_ALLOWED_CHAT_IDS.
+
+    Returns the allowed topics per chat key and the chat keys that are also listed
+    without a topic: those chats are allowed whole.
+    """
+    topics: dict[Union[int, str], set[int]] = {}
+    whole: set[Union[int, str]] = set()
+    for token in (raw or "").split(","):
+        token = token.strip()
+        if not token:
+            continue
+        chat, topic = _split_topic_entry(token)
+        key = _allowlist_chat_key(chat)
+        if key is None:
+            continue
+        if topic is None:
+            whole.add(key)
+        else:
+            topics.setdefault(key, set()).add(topic)
+    return {key: frozenset(ids) for key, ids in topics.items()}, frozenset(whole)
+
+
+def _effective_allowed_topics() -> _TopicLimits:
+    return _parse_allowed_topics(os.getenv("TELEGRAM_ALLOWED_CHAT_IDS"))
+
+
+def is_topic_allowlist_enabled() -> bool:
+    """True when TELEGRAM_ALLOWED_CHAT_IDS limits at least one chat to forum topics."""
+    return bool(_effective_allowed_topics()[0])
+
+
+def topic_limits_need_entity() -> bool:
+    """True when a topic limit or whole entry is listed by username, so only the
+    resolved chat entity can tell whether a numeric ID is limited."""
+    by_chat, whole = _effective_allowed_topics()
+    return bool(by_chat) and any(isinstance(key, str) for key in (*by_chat, *whole))
+
+
+def get_allowed_topics(
+    chat_identifier: Any = None, entity: Any = None
+) -> Optional[frozenset[int]]:
+    """Forum topic IDs a chat is limited to by TELEGRAM_ALLOWED_CHAT_IDS.
+
+    None means no topic limit: the chat is listed whole, or not listed at all (the
+    chat allowlist decides about that). The identifier and the entity are matched
+    like ``is_chat_allowed`` does, by marked ID and username; a chat that matches a
+    whole entry under one of them is allowed whole.
+    """
+    by_chat, whole = _effective_allowed_topics()
+    if not by_chat:
+        return None
+    keys: set[Union[int, str]] = set()
+    if chat_identifier is not None and not isinstance(chat_identifier, bool):
+        if isinstance(chat_identifier, int):
+            keys.add(int(chat_identifier))
+        else:
+            key = _allowlist_chat_key(str(chat_identifier).strip())
+            if key is not None:
+                keys.add(key)
+    if entity is not None:
+        try:
+            keys.add(get_marked_id(entity))
+        except Exception:
+            pass
+        username = getattr(entity, "username", None)
+        if username:
+            keys.add(str(username).lstrip("@").lower())
+    if keys & whole:
+        return None
+    limits = [by_chat[key] for key in keys if key in by_chat]
+    return frozenset().union(*limits) if limits else None
+
+
+def get_blocked_chat_ids() -> set[Union[int, str]]:
+    """Return the global blocklist in the same marked-ID format as the allowlist."""
+    return _parse_allowed_chat_ids(os.getenv("TELEGRAM_BLOCKED_CHAT_IDS")) or set()
+
+
+def is_chat_blocklist_enabled() -> bool:
+    return bool(get_blocked_chat_ids())
+
+
+def is_chat_blocked(chat_identifier: Any, entity: Any = None) -> bool:
+    blocked = get_blocked_chat_ids()
+    if not blocked:
+        return False
+    if chat_identifier is not None and not isinstance(chat_identifier, bool):
+        ident = str(chat_identifier).strip()
+        key = int(ident) if _NUMERIC_CHAT_ID_RE.fullmatch(ident) else ident.lstrip("@").lower()
+        if key in blocked:
+            return True
+    if entity is not None:
+        try:
+            if get_marked_id(entity) in blocked:
+                return True
+        except Exception:
+            try:
+                if utils.get_peer_id(entity) in blocked:
+                    return True
+            except Exception:
+                pass
+        username = getattr(entity, "username", None)
+        if username and str(username).lstrip("@").lower() in blocked:
+            return True
+    return False
+
+
 def is_chat_allowed(chat_identifier: Any, entity: Any = None) -> bool:
-    """Check whether a chat identifier or entity is permitted by the allowlist.
+    """Check whether a chat is permitted by the active access policies.
 
     Integer identifiers are compared as marked IDs (see
     ``_parse_allowed_chat_ids``); an entity is compared by its marked ID and
     username only. Its bare ``id`` is never used: the same number is a
     different chat in the user, basic-group and channel namespaces.
 
-    If allowlist is not enabled, always returns True.
+    The blocklist filters reads, while the allowlist applies to all operations.
     """
+    if _chat_policy_action.get() is None and is_chat_blocked(chat_identifier, entity):
+        return False
     allowed = get_effective_allowed_chat_ids()
     if allowed is None:
         return True
@@ -1270,12 +1653,58 @@ def is_chat_allowed(chat_identifier: Any, entity: Any = None) -> bool:
 
 def check_chat_access(chat_identifier: Any, entity: Any = None) -> Optional[str]:
     """Return an error message if chat access is restricted, or None if allowed."""
+    if _chat_policy_action.get() is None and is_chat_blocked(chat_identifier, entity):
+        return (
+            f"Access to chat '{chat_identifier}' is restricted by privacy policy "
+            "(TELEGRAM_BLOCKED_CHAT_IDS)."
+        )
     if not is_chat_allowed(chat_identifier, entity):
         return (
             f"Access to chat '{chat_identifier}' is restricted by privacy policy "
             "(TELEGRAM_ALLOWED_CHAT_IDS)."
         )
     return None
+
+
+def _topic_ids_text(topics: Iterable[int]) -> str:
+    return ", ".join(str(topic) for topic in sorted(topics))
+
+
+def topic_limited_tool_message(chat_identifier: Any, topics: Iterable[int], tool_name: str) -> str:
+    """Refusal for a tool that cannot keep to the forum topics a chat is limited to."""
+    return (
+        f"Access to chat '{chat_identifier}' is restricted by privacy policy "
+        f"(TELEGRAM_ALLOWED_CHAT_IDS): only forum topic(s) {_topic_ids_text(topics)} are "
+        f"allowed, and {tool_name} cannot be limited to a topic."
+    )
+
+
+def topic_outside_message(chat_identifier: Any, topics: Iterable[int], subject: str) -> str:
+    """Refusal for a message or topic outside the forum topics a chat is limited to."""
+    return (
+        f"{subject} in chat '{chat_identifier}' is restricted by privacy policy "
+        f"(TELEGRAM_ALLOWED_CHAT_IDS): only forum topic(s) {_topic_ids_text(topics)} "
+        "are allowed."
+    )
+
+
+async def _topic_limit_for_param(item: Any, account: Optional[str]) -> Optional[frozenset[int]]:
+    """The forum topic limit on the chat a tool parameter names, for validate_id.
+
+    A name is resolved first: the limit may be listed under the chat's ID. A numeric
+    ID is resolved too when entries name chats by username, so the gate matches the
+    same keys as the tools do. A chat that cannot be resolved is matched as written.
+    """
+    if not is_topic_allowlist_enabled():
+        return None
+    if not isinstance(item, str) and not topic_limits_need_entity():
+        return get_allowed_topics(item)
+    entity = None
+    try:
+        entity = await resolve_entity(item, get_client(account))
+    except Exception:
+        pass
+    return get_allowed_topics(item, entity)
 
 
 # Error code prefix mapping for better error tracing
@@ -1356,6 +1785,10 @@ def log_and_format_error(
     # verbatim and never log the user's nickname at ERROR level.
     if isinstance(error, AliasNeedsUser):
         return error.payload
+    if isinstance(error, ChatAccessDeniedError) and not user_message:
+        user_message = (
+            "Access to chat is restricted by privacy policy (TELEGRAM_BLOCKED_CHAT_IDS)."
+        )
 
     # Generate a consistent error code
     if isinstance(prefix, str) and prefix == "VALIDATION-001":
@@ -1381,12 +1814,15 @@ def log_and_format_error(
     # does not store WARNING records.
     if _is_flood_wait(error):
         seconds = getattr(error, "seconds", None) or 0
+        # Real Telegram evidence: feed the reactive circuit breaker (and the
+        # gate's adaptive backoff, when enabled) before formatting the reply.
+        _floodgate_report_flood(function_name, seconds)
         logger.warning("Telegram FloodWait; retry only after the reported delay.")
         if user_message:
             return user_message
         wait_clause = f"{seconds} seconds" if seconds > 0 else "an unknown duration"
         return (
-            f"Rate limit exceeded (FloodWait): Telegram requires waiting {wait_clause} "
+            f"{_FLOOD_WAIT_REPLY_PREFIX}: Telegram requires waiting {wait_clause} "
             f"before repeating this operation. Do NOT retry immediately (code: {error_code})."
         )
 
@@ -1423,13 +1859,17 @@ def log_and_format_error(
     return f"An error occurred (code: {error_code})."
 
 
-def validate_id(*param_names_to_validate, raise_errors=False):
+def validate_id(*param_names_to_validate, raise_errors=False, topic_aware=False):
     """
     Decorator to validate chat_id and user_id parameters, including lists of IDs.
     It checks for valid integer ranges, string representations of integers,
     and username formats.
     Set raise_errors to surface validation/privacy failures as MCP tool errors;
     other tools retain their existing return contract by default.
+    Set topic_aware on tools that keep to the forum topics a chat is limited to by
+    ``<chat>:<topic>`` entries of TELEGRAM_ALLOWED_CHAT_IDS (see get_allowed_topics);
+    every other tool is refused for such a chat, so a tool that does not know about
+    topics can never read or change the rest of it.
     """
 
     def error_result(message):
@@ -1440,6 +1880,20 @@ def validate_id(*param_names_to_validate, raise_errors=False):
     def decorator(func):
         @wraps(func)
         async def wrapper(*args, **kwargs):
+            if is_chat_blocklist_enabled() and args:
+                signature = inspect.signature(func)
+                bound = signature.bind_partial(*args, **kwargs)
+                if all(
+                    p.kind
+                    not in (
+                        inspect.Parameter.VAR_POSITIONAL,
+                        inspect.Parameter.VAR_KEYWORD,
+                        inspect.Parameter.POSITIONAL_ONLY,
+                    )
+                    for p in signature.parameters.values()
+                ):
+                    args = ()
+                    kwargs = dict(bound.arguments)
             for param_name in param_names_to_validate:
                 if param_name not in kwargs or kwargs[param_name] is None:
                     continue
@@ -1519,37 +1973,55 @@ def validate_id(*param_names_to_validate, raise_errors=False):
                         )
                     kwargs[param_name] = validated_value
 
-                # Per-chat privacy allowlist enforcement
-                if is_chat_allowlist_enabled() and param_name in CHAT_PARAM_NAMES:
-                    check_target = kwargs[param_name]
-                    target_items = (
-                        check_target if isinstance(check_target, list) else [check_target]
-                    )
-                    for item in target_items:
-                        if not is_chat_allowed(item):
-                            resolved_allowed = False
+                if param_name in CHAT_PARAM_NAMES:
+                    target = kwargs[param_name]
+                    items = target if isinstance(target, list) else [target]
+                    for item in items:
+                        if _chat_policy_action.get() is None and is_chat_blocked(item):
+                            err = check_chat_access(item)
+                        elif is_chat_allowlist_enabled() and not is_chat_allowed(item):
+                            entity = None
                             if isinstance(item, str):
                                 try:
                                     cl = get_client(kwargs.get("account"))
                                     if cl:
-                                        ent = await resolve_entity(item, cl)
-                                        if is_chat_allowed(item, ent):
-                                            resolved_allowed = True
+                                        entity = await resolve_entity(item, cl)
                                 except Exception:
                                     pass
-                            if not resolved_allowed:
-                                err = check_chat_access(item)
-                                return error_result(
-                                    log_and_format_error(
-                                        func.__name__,
-                                        ChatAccessDeniedError(err),
-                                        prefix=ErrorCategory.PRIVACY,
-                                        user_message=err,
-                                        **{param_name: param_value},
-                                    )
+                            err = check_chat_access(item, entity)
+                        else:
+                            err = None
+                        if err is None and not topic_aware:
+                            topics = await _topic_limit_for_param(item, kwargs.get("account"))
+                            if topics is not None:
+                                err = topic_limited_tool_message(item, topics, func.__name__)
+                        if err:
+                            return error_result(
+                                log_and_format_error(
+                                    func.__name__,
+                                    ChatAccessDeniedError(err),
+                                    prefix=ErrorCategory.PRIVACY,
+                                    user_message=err,
+                                    **{param_name: param_value},
                                 )
+                            )
 
-            return await func(*args, **kwargs)
+            if not is_chat_blocklist_enabled():
+                return await func(*args, **kwargs)
+
+            targets = []
+            for name in param_names_to_validate:
+                if name in CHAT_PARAM_NAMES and kwargs.get(name) is not None:
+                    value = kwargs[name]
+                    targets.extend(value if isinstance(value, list) else [value])
+            redaction = _chat_policy_action.get()
+            if redaction is not None:
+                redaction[0] = redaction[0] or any(is_chat_blocked(target) for target in targets)
+            token = _chat_policy_targets.set(tuple(targets))
+            try:
+                return await func(*args, **kwargs)
+            finally:
+                _chat_policy_targets.reset(token)
 
         return wrapper
 
@@ -1689,6 +2161,61 @@ def _rich_text_target(node):
     if isinstance(node, types.PageBlockEmbed):
         return node.url
     return None
+
+
+LINK_ENTITY_TYPES = (
+    types.MessageEntityTextUrl,
+    types.MessageEntityUrl,
+    types.MessageEntityMentionName,
+    types.InputMessageEntityMentionName,
+)
+
+
+def mention_user_id(entity):
+    """Numeric user ID of a mention-name entity (InputUser for the Input variant)."""
+    user_id = getattr(entity, "user_id", None)
+    if user_id is not None and not isinstance(user_id, int):
+        user_id = getattr(user_id, "user_id", None)
+    return user_id
+
+
+def get_link_metadata(msg) -> dict:
+    """Links carried by message entities, paired with the text they sit on.
+
+    Returns {"links": [...]} with {text, url} for text links (MessageEntityTextUrl)
+    and explicit URLs (MessageEntityUrl), and {text, user_id} for mentions of
+    users without a username (MessageEntityMentionName and its Input variant).
+    Returns {} when the message has none, so callers can splat it into records.
+
+    Like custom emojis, text is cut from the original message: entity offsets
+    are UTF-16 code units, and sanitizing first would shift them.
+    """
+    entities = [
+        entity
+        for entity in getattr(msg, "entities", None) or []
+        if isinstance(entity, LINK_ENTITY_TYPES)
+    ]
+    text = getattr(msg, "message", None)
+    if not text or not entities:
+        return {}
+    links = []
+    for entity, inner in zip(entities, utils.get_inner_text(text, entities)):
+        link_text = sanitize_user_content(inner, max_length=256, preserve_emoji=True)
+        if isinstance(
+            entity, (types.MessageEntityMentionName, types.InputMessageEntityMentionName)
+        ):
+            user_id = mention_user_id(entity)
+            if user_id is None:
+                continue
+            link = {"text": link_text, "user_id": user_id}
+        else:
+            url = getattr(entity, "url", None) or inner
+            if not url:
+                continue
+            link = {"text": link_text, "url": sanitize_user_content(url, max_length=2048)}
+        if link not in links:
+            links.append(link)
+    return {"links": links} if links else {}
 
 
 def rich_message_link_urls(msg) -> List[str]:
@@ -2217,9 +2744,20 @@ async def _resolve(getter: str, identifier: Union[int, str], client, label: str)
         # An id that came from a saved alias is exact; guessing marked variants of
         # it could deliver to a completely unrelated chat.
         from_alias = identifier is not original
-        return await _resolve_with_retries(
+        entity = await _resolve_with_retries(
             getter, identifier, client, label, try_marked=not from_alias
         )
+        targets = _chat_policy_targets.get()
+        if (
+            targets
+            and any(identifier == apply_alias(target) for target in targets)
+            and is_chat_blocked(identifier, entity)
+        ):
+            redaction = _chat_policy_action.get()
+            if redaction is None:
+                raise ChatAccessDeniedError(check_chat_access(identifier, entity))
+            redaction[0] = True
+        return entity
     except (ValueError, *_PEER_ERRORS) as error:
         # An unknown or stale nickname is a question for the user, not a dead end:
         # report the wording they used, never the opaque stored id.

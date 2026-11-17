@@ -1,6 +1,7 @@
 """Media MCP tools."""
 
 import io
+import json
 import mimetypes
 import os
 import shutil
@@ -26,7 +27,12 @@ from telegram_mcp.photo_source import (
     list_photo_references,
     validate_source,
 )
-from telegram_mcp.tools.messages import _plain_entities, _plain_text_conflict
+from telegram_mcp.tools.messages import (
+    _plain_entities,
+    _plain_text_conflict,
+    in_allowed_topics,
+    topic_refusal,
+)
 
 PHOTO_IDENTIFIER_SEARCH_DEPTH = 100
 PHOTO_SHEET_MAXIMUM_TILES = 12
@@ -48,6 +54,19 @@ def _force_document_kwargs(force_document: bool) -> Dict[str, bool]:
     # Only pass force_document when the caller set it, so the default call
     # reaches Telethon exactly as before.
     return {"force_document": True} if force_document else {}
+
+
+def _sent_message_ids(result) -> list[Optional[int]]:
+    """Positional IDs returned by Telethon for a message or media group."""
+    messages = result if isinstance(result, (list, tuple)) else [result]
+    return [getattr(message, "id", None) for message in messages]
+
+
+def _append_message_ids(result_text: str, sent) -> str:
+    ids = _sent_message_ids(sent)
+    return (
+        f"{result_text}\nMessageIDs: {json.dumps(ids, ensure_ascii=False)}" if ids else result_text
+    )
 
 
 def _video_send_attributes(path: str):
@@ -222,6 +241,7 @@ class _DownloadLimitExceeded(Exception):
 @mcp.tool(annotations=ToolAnnotations(title="Send File", openWorldHint=True, destructiveHint=True))
 @with_account(readonly=False)
 @validate_id("chat_id")
+@flood_category("send")
 async def send_file(
     chat_id: Union[int, str],
     file_path: Union[str, List[str]],
@@ -233,9 +253,12 @@ async def send_file(
     custom_emojis: Optional[List[Dict[str, Any]]] = None,
     ctx: Optional[Context] = None,
     account: Optional[str] = None,
+    silent: bool = False,
 ) -> str:
     """
     Send a file to a chat.
+    On success, the existing status line is followed by MessageIDs containing
+    the message ID for a single file or the ordered message IDs for an album.
     Reuse custom_emojis from message-reading tools in the caption with
     parse_mode='html' and <tg-emoji emoji-id="ID">EMOJI</tg-emoji>, using the
     returned id and emoji. HTML-escape the emoji and other literal text. Custom
@@ -247,6 +270,7 @@ async def send_file(
         file_path: Absolute or relative path to the file under allowed roots.
             Pass a list of 2-10 paths to send them as one Telegram media group.
         caption: Optional caption for the file or media group.
+        silent: Send without a notification sound (default False).
         topic_id: Optional forum topic ID (from list_topics). Sends into that topic
             in a forum-enabled community/supergroup. Also works as reply_to for a message.
         schedule_date: Optional. When set, the file is placed in the chat's
@@ -281,6 +305,7 @@ async def send_file(
                 custom_emojis=custom_emojis,
                 ctx=ctx,
                 account=account,
+                silent=silent,
             )
 
         dt = None
@@ -307,7 +332,7 @@ async def send_file(
             video_attributes = _video_send_attributes(str(safe_path))
             if video_attributes is not None:
                 send_kwargs["attributes"] = [video_attributes]
-        await cl.send_file(
+        sent = await cl.send_file(
             entity,
             str(safe_path),
             caption=caption,
@@ -315,10 +340,13 @@ async def send_file(
             schedule=dt,
             **send_kwargs,
             **caption_kwargs,
+            silent=silent,
         )
         if dt:
-            return f"File from {safe_path} scheduled for {dt.isoformat()} in chat {chat_id}."
-        return f"File sent to chat {chat_id} from {safe_path}."
+            result = f"File from {safe_path} scheduled for {dt.isoformat()} in chat {chat_id}."
+        else:
+            result = f"File sent to chat {chat_id} from {safe_path}."
+        return _append_message_ids(result, sent)
     except Exception as e:
         return log_and_format_error(
             "send_file",
@@ -331,6 +359,7 @@ async def send_file(
             force_document=force_document,
             parse_mode=parse_mode,
             custom_emojis=custom_emojis,
+            silent=silent,
         )
 
 
@@ -345,6 +374,7 @@ async def _send_album(
     custom_emojis: Optional[List[Dict[str, Any]]] = None,
     ctx: Optional[Context] = None,
     account: str = None,
+    silent: bool = False,
 ) -> str:
     if not 2 <= len(file_paths) <= 10:
         return "Albums must contain between 2 and 10 files."
@@ -379,7 +409,7 @@ async def _send_album(
         [_video_send_attributes(path) for path in safe_paths] if not force_document else None
     )
     if per_file_attributes is None or not any(per_file_attributes):
-        await cl.send_file(
+        sent = await cl.send_file(
             entity,
             safe_paths,
             caption=caption,
@@ -387,6 +417,7 @@ async def _send_album(
             schedule=dt,
             **_force_document_kwargs(force_document),
             **caption_kwargs,
+            silent=silent,
         )
     else:
         media_items = []
@@ -394,19 +425,22 @@ async def _send_album(
             media_items.append(
                 _album_media_item(safe_path, await cl.upload_file(safe_path), video_attributes)
             )
-        await cl.send_file(
+        sent = await cl.send_file(
             entity,
             media_items,
             caption=caption,
             reply_to=topic_id,
             schedule=dt,
             **caption_kwargs,
+            silent=silent,
         )
     if dt:
-        return (
+        result = (
             f"Album of {len(safe_paths)} files scheduled for {dt.isoformat()} in chat {chat_id}."
         )
-    return f"Album sent to chat {chat_id} with {len(safe_paths)} files."
+    else:
+        result = f"Album sent to chat {chat_id} with {len(safe_paths)} files."
+    return _append_message_ids(result, sent)
 
 
 def _album_media_item(path: str, file_handle, video_attributes):
@@ -435,6 +469,7 @@ def _album_media_item(path: str, file_handle, video_attributes):
 )
 @with_account(readonly=False)
 @validate_id("chat_id")
+@flood_category("send")
 async def send_album(
     chat_id: Union[int, str],
     file_paths: List[str],
@@ -445,9 +480,11 @@ async def send_album(
     custom_emojis: Optional[List[Dict[str, Any]]] = None,
     ctx: Optional[Context] = None,
     account: Optional[str] = None,
+    silent: bool = False,
 ) -> str:
     """
     Send multiple photos/videos as one Telegram media group (album).
+    On success, the existing status line is followed by MessageIDs in file order.
     The caption is formatted as in send_file: parse_mode='html' reads
     <tg-emoji emoji-id="ID">EMOJI</tg-emoji>, and custom_emojis marks emoji in a
     plain-text caption.
@@ -456,6 +493,7 @@ async def send_album(
         chat_id: The chat ID or username.
         file_paths: 2-10 absolute or relative file paths under allowed roots.
         caption: Optional caption for the album. Telegram displays it on the first item.
+        silent: Send without a notification sound (default False).
         topic_id: Optional forum topic ID (from list_topics). Sends into that topic
             in a forum-enabled community/supergroup. Also works as reply_to for a message.
         schedule_date: Optional. When set, the album is placed in the chat's
@@ -479,6 +517,7 @@ async def send_album(
             custom_emojis=custom_emojis,
             ctx=ctx,
             account=account,
+            silent=silent,
         )
     except Exception as e:
         return log_and_format_error(
@@ -491,6 +530,73 @@ async def send_album(
             schedule_date=str(schedule_date),
             parse_mode=parse_mode,
             custom_emojis=custom_emojis,
+            silent=silent,
+        )
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        title="Edit Message Media", openWorldHint=True, destructiveHint=True, idempotentHint=True
+    )
+)
+@with_account(readonly=False)
+@validate_id("chat_id")
+async def edit_message_media(
+    chat_id: Union[int, str],
+    message_id: int,
+    file_path: str,
+    caption: Optional[str] = None,
+    parse_mode: Optional[str] = None,
+    ctx: Optional[Context] = None,
+    account: Optional[str] = None,
+) -> str:
+    """Replace the media in one message you sent.
+
+    For an album, message_id selects one item to replace. Telegram enforces the
+    album's media-type restrictions. An omitted caption keeps the current caption
+    and formatting; an empty caption clears it. Since preserving an omitted
+    caption requires a read followed by an edit, a concurrent caption change from
+    another client can be overwritten; pass caption explicitly to set its value.
+    """
+    try:
+        safe_path, path_error = await _resolve_readable_file_path(
+            raw_path=file_path,
+            ctx=ctx,
+            tool_name="edit_message_media",
+        )
+        if path_error:
+            return path_error
+
+        cl = get_client(account)
+        entity = await resolve_entity(chat_id, cl)
+        current = await cl.get_messages(entity, ids=message_id)
+        if current is None:
+            return f"Message {message_id} not found in chat {chat_id}."
+
+        new_caption = current.message if caption is None else caption
+        kwargs = {"file": str(safe_path)}
+        video_attributes = _video_send_attributes(str(safe_path))
+        if video_attributes is not None:
+            kwargs["attributes"] = [video_attributes]
+        if caption is None:
+            kwargs.update(parse_mode=None, formatting_entities=current.entities or [])
+        else:
+            caption_kwargs, caption_error = _caption_format_kwargs(caption, parse_mode, None)
+            if caption_error:
+                return caption_error
+            kwargs.update(caption_kwargs)
+
+        await cl.edit_message(entity, message_id, new_caption, **kwargs)
+        return f"Media in message {message_id} replaced."
+    except telethon.errors.MessageNotModifiedError:
+        return f"Message {message_id} not modified: the media and caption are unchanged."
+    except Exception as e:
+        return log_and_format_error(
+            "edit_message_media",
+            e,
+            chat_id=chat_id,
+            message_id=message_id,
+            file_path=file_path,
         )
 
 
@@ -525,7 +631,11 @@ async def download_media(
     """
     try:
         cl = get_client(account)
+        if is_chat_blocked(chat_id):
+            return "Message data is restricted by TELEGRAM_BLOCKED_CHAT_IDS."
         entity = await resolve_entity(chat_id, cl)
+        if is_chat_blocked(chat_id, entity):
+            return "Message data is restricted by TELEGRAM_BLOCKED_CHAT_IDS."
         msg = await cl.get_messages(entity, ids=message_id)
         if not msg:
             return "No media found in the specified message."
@@ -629,12 +739,14 @@ async def download_media(
 )
 @with_account(readonly=False)
 @validate_id("chat_id")
+@flood_category("send")
 async def send_voice(
     chat_id: Union[int, str],
     file_path: str,
     topic_id: Optional[int] = None,
     ctx: Optional[Context] = None,
     account: Optional[str] = None,
+    silent: bool = False,
 ) -> str:
     """
     Send a voice message to a chat. File must be an OGG/OPUS voice note.
@@ -644,6 +756,7 @@ async def send_voice(
         file_path: Absolute or relative path under allowed roots to the OGG/OPUS file.
         topic_id: Optional forum topic ID (from list_topics). Sends into that topic
             in a forum-enabled community/supergroup. Also works as reply_to for a message.
+        silent: Send without a notification sound (default False).
     """
     try:
         cl = get_client(account)
@@ -667,11 +780,18 @@ async def send_voice(
             return "Voice file must be .ogg or .opus format."
 
         entity = await resolve_entity(chat_id, cl)
-        await cl.send_file(entity, str(safe_path), voice_note=True, reply_to=topic_id)
+        await cl.send_file(
+            entity, str(safe_path), voice_note=True, reply_to=topic_id, silent=silent
+        )
         return f"Voice message sent to chat {chat_id} from {safe_path}."
     except Exception as e:
         return log_and_format_error(
-            "send_voice", e, chat_id=chat_id, file_path=file_path, topic_id=topic_id
+            "send_voice",
+            e,
+            chat_id=chat_id,
+            file_path=file_path,
+            topic_id=topic_id,
+            silent=silent,
         )
 
 
@@ -679,6 +799,7 @@ async def send_voice(
     annotations=ToolAnnotations(title="Upload File", openWorldHint=True, destructiveHint=True)
 )
 @with_account(readonly=False)
+@flood_category("send")
 async def upload_file(
     file_path: str, ctx: Optional[Context] = None, account: Optional[str] = None
 ) -> str:
@@ -715,7 +836,7 @@ async def upload_file(
     annotations=ToolAnnotations(title="Get Media Info", openWorldHint=True, readOnlyHint=True)
 )
 @with_account(readonly=True)
-@validate_id("chat_id")
+@validate_id("chat_id", topic_aware=True)
 async def get_media_info(
     chat_id: Union[int, str], message_id: int, account: Optional[str] = None
 ) -> str:
@@ -733,6 +854,11 @@ async def get_media_info(
 
         if not msg:
             return "No media found in the specified message."
+        allowed_topics = get_allowed_topics(chat_id, entity)
+        if not in_allowed_topics(msg, allowed_topics):
+            return topic_refusal(
+                "get_media_info", chat_id, allowed_topics, f"Message {message_id}"
+            )
         if msg.media:
             return str(msg.media)
         # Block-format posts keep their embedded photos/videos in
@@ -772,12 +898,14 @@ async def get_sticker_sets(account: Optional[str] = None) -> str:
 )
 @with_account(readonly=False)
 @validate_id("chat_id")
+@flood_category("send")
 async def send_sticker(
     chat_id: Union[int, str],
     file_path: str,
     topic_id: Optional[int] = None,
     ctx: Optional[Context] = None,
     account: Optional[str] = None,
+    silent: bool = False,
 ) -> str:
     """
     Send a sticker to a chat. File must be a valid .webp sticker file.
@@ -787,6 +915,7 @@ async def send_sticker(
         file_path: Absolute or relative path under allowed roots to the .webp sticker file.
         topic_id: Optional forum topic ID (from list_topics). Sends into that topic
             in a forum-enabled community/supergroup. Also works as reply_to for a message.
+        silent: Send without a notification sound (default False).
     """
     try:
         cl = get_client(account)
@@ -799,11 +928,18 @@ async def send_sticker(
             return path_error
 
         entity = await resolve_entity(chat_id, cl)
-        await cl.send_file(entity, str(safe_path), force_document=False, reply_to=topic_id)
+        await cl.send_file(
+            entity, str(safe_path), force_document=False, reply_to=topic_id, silent=silent
+        )
         return f"Sticker sent to chat {chat_id} from {safe_path}."
     except Exception as e:
         return log_and_format_error(
-            "send_sticker", e, chat_id=chat_id, file_path=file_path, topic_id=topic_id
+            "send_sticker",
+            e,
+            chat_id=chat_id,
+            file_path=file_path,
+            topic_id=topic_id,
+            silent=silent,
         )
 
 
@@ -864,11 +1000,13 @@ async def get_gif_search(query: str, limit: int = 10, account: Optional[str] = N
 @mcp.tool(annotations=ToolAnnotations(title="Send Gif", openWorldHint=True, destructiveHint=True))
 @with_account(readonly=False)
 @validate_id("chat_id")
+@flood_category("send")
 async def send_gif(
     chat_id: Union[int, str],
     gif_id: int,
     topic_id: Optional[int] = None,
     account: Optional[str] = None,
+    silent: bool = False,
 ) -> str:
     """
     Send a GIF to a chat by Telegram GIF document ID (not a file path).
@@ -879,6 +1017,7 @@ async def send_gif(
             saved in the account).
         topic_id: Optional forum topic ID (from list_topics). Sends into that topic
             in a forum-enabled community/supergroup. Also works as reply_to for a message.
+        silent: Send without a notification sound (default False).
     """
     try:
         cl = get_client(account)
@@ -894,11 +1033,16 @@ async def send_gif(
                 f"GIF {gif_id} is unknown to this session. Run get_gif_search "
                 "first and use an ID from its result."
             )
-        await cl.send_file(entity, gif, reply_to=topic_id)
+        await cl.send_file(entity, gif, reply_to=topic_id, silent=silent)
         return f"GIF sent to chat {chat_id}."
     except Exception as e:
         return log_and_format_error(
-            "send_gif", e, chat_id=chat_id, gif_id=gif_id, topic_id=topic_id
+            "send_gif",
+            e,
+            chat_id=chat_id,
+            gif_id=gif_id,
+            topic_id=topic_id,
+            silent=silent,
         )
 
 
@@ -961,7 +1105,7 @@ async def list_photos(
 
 @mcp.tool(annotations=ToolAnnotations(title="Open Photo", openWorldHint=True, readOnlyHint=True))
 @with_account(readonly=True)
-@validate_id("chat_id")
+@validate_id("chat_id", topic_aware=True)
 async def open_photo(
     chat_id: Union[int, str],
     photo_id: Optional[int] = None,
@@ -985,6 +1129,15 @@ async def open_photo(
     try:
         cl = get_client(account)
         entity = await resolve_entity(chat_id, cl)
+
+        # Avatars belong to the chat; a photo posted in it must be in an allowed topic.
+        allowed_topics = get_allowed_topics(chat_id, entity)
+        if message_id is not None and allowed_topics is not None:
+            posted = await cl.get_messages(entity, ids=message_id)
+            if posted is not None and not in_allowed_topics(posted, allowed_topics):
+                return topic_refusal(
+                    "open_photo", chat_id, allowed_topics, f"Message {message_id}"
+                )
 
         wanted_source = "messages" if message_id is not None else AVATAR_SOURCE
         wanted_identifier = message_id if message_id is not None else photo_id
@@ -1122,7 +1275,7 @@ def _sniff_image_format(data: bytes) -> Optional[str]:
     )
 )
 @with_account(readonly=True)
-@validate_id("chat_id")
+@validate_id("chat_id", topic_aware=True)
 async def inspect_document(
     chat_id: Union[int, str],
     message_id: int,
@@ -1144,6 +1297,11 @@ async def inspect_document(
         entity = await resolve_entity(chat_id, cl)
         msg = await cl.get_messages(entity, ids=message_id)
 
+        allowed_topics = get_allowed_topics(chat_id, entity)
+        if msg and not in_allowed_topics(msg, allowed_topics):
+            return topic_refusal(
+                "inspect_document", chat_id, allowed_topics, f"Message {message_id}"
+            )
         if not msg or not msg.media:
             return "There is no attached document or media file in the specified message."
 
@@ -1232,6 +1390,7 @@ async def inspect_document(
 __all__ = [
     "send_file",
     "send_album",
+    "edit_message_media",
     "download_media",
     "list_photos",
     "open_photo",
