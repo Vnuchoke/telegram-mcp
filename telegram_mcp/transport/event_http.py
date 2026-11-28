@@ -73,12 +73,8 @@ class EventHeadersMiddleware:
                 {"error": "Duplicate MCP-Protocol-Version header"}, status_code=400
             )(scope, receive, send)
             return
-        headers = dict(scope.get("headers", []))
-        if (
-            scope["type"] != "http"
-            or scope.get("method") != "POST"
-            or headers.get(b"mcp-protocol-version") != b"2026-07-28"
-        ):
+        version = versions[0].strip() if versions else None
+        if scope["type"] != "http" or scope.get("method") != "POST" or version != b"2026-07-28":
             await self.app(scope, receive, send)
             return
         try:

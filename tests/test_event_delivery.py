@@ -338,6 +338,67 @@ def test_encoded_event_headers_and_duplicate_protocol_version():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "version_header",
+    [
+        (b"mcp-protocol-version", b" 2026-07-28 "),
+        (b"MCP-Protocol-Version", b"2026-07-28"),
+        (b"MCP-Protocol-Version", b"\t2026-07-28 "),
+    ],
+)
+async def test_event_headers_middleware_enforces_routing_on_padded_or_mixed_case_version(
+    version_header,
+):
+    """Match ProtocolNegotiationMiddleware's case-insensitive, stripped version check."""
+    import json
+
+    body = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "events/list"}).encode()
+    called = False
+
+    async def downstream(scope, receive, send):
+        nonlocal called
+        called = True
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"{}"})
+
+    from telegram_mcp.transport.event_http import EventHeadersMiddleware
+
+    middleware = EventHeadersMiddleware(downstream, max_body=65536)
+    sent = []
+    body_sent = False
+
+    async def receive():
+        nonlocal body_sent
+        if not body_sent:
+            body_sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        return {"type": "http.disconnect"}
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "http",
+        "path": "/mcp",
+        "raw_path": b"/mcp",
+        "query_string": b"",
+        "headers": [
+            (b"host", b"localhost:8765"),
+            (b"content-type", b"application/json"),
+            version_header,
+        ],
+    }
+    await middleware(scope, receive, send)
+    assert called is False
+    start = next(m for m in sent if m["type"] == "http.response.start")
+    assert start["status"] == 400
+
+
+@pytest.mark.asyncio
 async def test_gap_active_advances_before_first_unread_event(monkeypatch):
     protocol = install_events(FastMCP("gap"))
     frames = []
