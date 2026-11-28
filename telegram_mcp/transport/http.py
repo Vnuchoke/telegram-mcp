@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Optional
 
 from starlette.responses import JSONResponse, Response
@@ -24,6 +25,11 @@ logger = logging.getLogger(__name__)
 _DEFAULT_ALLOWED_ORIGINS = ("http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*")
 
 
+def _header_values(scope: Scope, name: bytes) -> list[bytes]:
+    """Return all raw ASGI header values matching ``name`` (lowercase bytes)."""
+    return [v for k, v in scope.get("headers", []) if k.lower() == name]
+
+
 def _origin_matches(origin: str, allowed_origins: Any) -> bool:
     """Match an Origin header like FastMCP does: exact, or ``scheme://host:*``."""
     for allowed in allowed_origins or ():
@@ -31,7 +37,7 @@ def _origin_matches(origin: str, allowed_origins: Any) -> bool:
             return True
         if allowed.endswith(":*") and origin.startswith(allowed[:-2] + ":"):
             port = origin[len(allowed) - 1 :]
-            if port.isdigit():
+            if port.isascii() and port.isdigit() and 1 <= int(port) <= 65535:
                 return True
     return False
 
@@ -70,20 +76,30 @@ class ProtocolNegotiationMiddleware:
     def __init__(self, app: ASGIApp, mcp_instance: Any = None):
         self.app = app
         self.mcp_instance = mcp_instance
+        self.authenticated = os.getenv("TELEGRAM_MCP_HTTP_TOKEN") is not None or bool(
+            getattr(mcp_instance, "_token_verifier", None)
+        )
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
-        headers = dict(scope.get("headers", []))
-        raw_origin = headers.get(b"origin")
-        origin = raw_origin.decode("latin-1").strip() if raw_origin else None
-        if not is_origin_allowed(origin, self.mcp_instance):
-            logger.warning("Rejected request from disallowed Origin: %s", origin)
+        origin_values = _header_values(scope, b"origin")
+        if len(origin_values) > 1:
+            logger.warning("Rejected request with duplicate Origin headers")
             response = Response("Invalid Origin header", status_code=403)
             await response(scope, receive, send)
             return
+        if origin_values:
+            origin: Optional[str] = origin_values[0].decode("latin-1").strip()
+            if not origin or not is_origin_allowed(origin, self.mcp_instance):
+                logger.warning("Rejected request from disallowed Origin: %s", origin)
+                response = Response("Invalid Origin header", status_code=403)
+                await response(scope, receive, send)
+                return
+        else:
+            origin = None
         cors_origin_headers = (
             {"Access-Control-Allow-Origin": origin, "Vary": "Origin"} if origin else {}
         )
@@ -93,17 +109,36 @@ class ProtocolNegotiationMiddleware:
             await self.app(scope, receive, send)
             return
 
-        await self._negotiate(scope, receive, send, headers, cors_origin_headers)
+        await self._negotiate(scope, receive, send, cors_origin_headers)
 
     async def _negotiate(
         self,
         scope: Scope,
         receive: Receive,
         send: Send,
-        headers: dict,
         cors_origin_headers: dict,
     ) -> None:
-        raw_version_bytes = headers.get(MCP_PROTOCOL_VERSION_HEADER.encode("latin-1"))
+        version_values = _header_values(
+            scope, MCP_PROTOCOL_VERSION_HEADER.encode("latin-1").lower()
+        )
+        if len(version_values) > 1:
+            response = JSONResponse(
+                status_code=400,
+                content={
+                    "jsonrpc": "2.0",
+                    "id": "server-error",
+                    "error": {
+                        "code": -32600,
+                        "message": "Bad Request: Duplicate MCP-Protocol-Version header",
+                    },
+                },
+                headers={
+                    MCP_PROTOCOL_VERSION_HEADER: DEFAULT_PROTOCOL_VERSION,
+                },
+            )
+            await response(scope, receive, send)
+            return
+        raw_version_bytes = version_values[0] if version_values else None
         requested_version = (
             raw_version_bytes.decode("latin-1").strip() if raw_version_bytes else None
         )
@@ -111,7 +146,8 @@ class ProtocolNegotiationMiddleware:
         # 1. Handle OPTIONS discovery / CORS preflight
         if scope.get("method") == "OPTIONS":
             cors_headers = (
-                "Content-Type, Accept, MCP-Protocol-Version, MCP-Session-Id, Authorization"
+                "Content-Type, Accept, MCP-Protocol-Version, MCP-Session-Id, "
+                "Authorization, Mcp-Method, Mcp-Name"
             )
             response = Response(
                 status_code=204,
@@ -156,8 +192,17 @@ class ProtocolNegotiationMiddleware:
             negotiated_version = DEFAULT_PROTOCOL_VERSION
 
         # 3. Handle plain GET discovery probe (clients querying without text/event-stream)
-        accept_header = headers.get(b"accept", b"").decode("latin-1").lower()
-        if scope.get("method") == "GET" and "text/event-stream" not in accept_header:
+        accept_header = b", ".join(_header_values(scope, b"accept")).decode("latin-1").lower()
+        endpoint = getattr(
+            getattr(self.mcp_instance, "settings", None), "streamable_http_path", "/mcp"
+        )
+        path = scope.get("path", "").removeprefix(scope.get("root_path", ""))
+        if (
+            scope.get("method") == "GET"
+            and "text/event-stream" not in accept_header
+            and path.rstrip("/") == endpoint.rstrip("/")
+            and not self.authenticated
+        ):
             discovery_data = {
                 "name": "telegram",
                 "version": "2.0.1",
@@ -212,9 +257,25 @@ def patch_fastmcp_streamable_http() -> None:
         original_streamable_http_app = FastMCP.streamable_http_app
 
         def wrapped_streamable_http_app(self: Any, *args: Any, **kwargs: Any) -> Any:
-            app = original_streamable_http_app(self, *args, **kwargs)
-            return ProtocolNegotiationMiddleware(app, self)
+            from telegram_mcp.transport.event_http import with_events
 
+            app = original_streamable_http_app(self, *args, **kwargs)
+            return ProtocolNegotiationMiddleware(with_events(app, self), self)
+
+        original_sse_app = FastMCP.sse_app
+
+        def wrapped_sse_app(self: Any, *args: Any, **kwargs: Any) -> Any:
+            from telegram_mcp.event_protocol import EventTransport, install_events
+            from telegram_mcp.transport.auth import with_http_auth
+
+            install_events(self)
+            app = original_sse_app(self, *args, **kwargs)
+            with_http_auth(
+                app, self, [self.settings.sse_path, self.settings.message_path.rstrip("/")]
+            )
+            return EventTransport(app, "sse")
+
+        FastMCP.sse_app = wrapped_sse_app
         FastMCP.streamable_http_app = wrapped_streamable_http_app  # type: ignore[assignment]
         FastMCP._protocol_negotiation_patched = True  # type: ignore[attr-defined]
     except (ImportError, AttributeError) as exc:

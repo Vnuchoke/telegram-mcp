@@ -124,7 +124,7 @@ Without a state file the count lives in memory and restarts from zero with the s
 When a reference is unknown, resembles one contact, matches several, or points at a contact that no longer resolves, tools send nothing and return a structured instruction telling the agent exactly what to ask you, to save the answer with `set_contact_alias`, and to retry once. `list_contact_aliases` shows one row per person with all their aliases (use it to spot a wrong memory), `delete_contact_alias` forgets one, and repointing an alias at someone else requires `replace=True`. The save path itself refuses a target it would have to guess at: contacts are saved by @username, phone, numeric ID, or an alias already confirmed for them.
 
 Aliases live in `${XDG_STATE_HOME:-~/.local/state}/telegram-mcp/aliases.json` (owner-only, written atomically); `TELEGRAM_ALIASES_FILE` overrides the path, and a pre-existing `aliases.json` next to the code is still read as a fallback.
-- **Media:** send files, download media, upload files, send voice notes, stickers, GIFs, inspect message media, and transcribe voice messages/video notes (see below).
+- **Media:** send files, download media, upload files, send voice notes, stickers, GIFs, inspect message media, transcribe voice messages/video notes, and look at videos (see below).
 
 ### Voice transcription
 
@@ -146,6 +146,22 @@ The engine is chosen per call via the `engine` argument, or otherwise defaults t
 - `auto`: `get_history`, `get_messages`, `list_messages`, and `search_messages` also prefetch missing transcripts, bounded per call by `TELEGRAM_TRANSCRIBE_MAX_VOICES`/`TELEGRAM_TRANSCRIBE_MAX_SECONDS` (Groq isn't free, so this prefetch is budgeted rather than unbounded).
 
 The cache lives in `TELEGRAM_TRANSCRIPT_CACHE_DIR` (default `data/transcripts` in the working directory, or `~/.cache/telegram-mcp/transcripts` when that is not writable), written as a 700 directory / 600 file since it holds personal-chat text in plaintext — see [Docker](#docker) for why this needs its own volume mount in a container.
+
+### Looking at videos
+
+`view_video(chat_id, message_id, start=None, end=None, max_frames=8, transcribe=True)` lets a model that reads images but not video look at a video, video note or animation. It returns still frames as separate images, each labelled with its time, plus the sound transcribed and merged with the frames into one timeline:
+
+```text
+0:21-0:25 This one is the Lenovo board, see the PCIe slots.
+0:24 [frame 4]
+0:26-0:30 They sit next to each other, two cards won't fit here.
+```
+
+- **Frames** are taken where the picture changes (ffmpeg's scene score over a few small frames per second) and, between those, at even spacing, so a screencast or a slide deck shows every new screen and a talking head still gets evenly spread frames. Near-identical frames are dropped. `max_frames` is 1-16; frames are at most 768 px on their long side.
+- **Zoom:** call again with `start`/`end` (seconds) around a part to get denser frames and a transcript of only that part.
+- **Speech** goes to the transcription engine configured for `transcribe_voice` (`TELEGRAM_TRANSCRIBE_ENGINE`), sent as 16 kHz mono FLAC. `groq`, `openai` (when the endpoint answers `verbose_json` with `segments`; otherwise the plain text follows the timeline) and `whisper` give timestamps. `telegram` transcribes only whole video notes, without timestamps. `TELEGRAM_TRANSCRIBE=off` or `transcribe=false` skips speech. Video transcripts are not cached.
+- **Time limit:** the tool works within `TELEGRAM_TOOL_TIMEOUT_SECONDS`. Frames are taken while the speech is transcribed; if the transcript is not ready in time, the frames come back with a note to ask for a shorter part. Raise the timeout for long videos with a slow local engine.
+- **Requirements:** `ffmpeg` and `ffprobe` on the server's `PATH` (included in the Docker image). Videos above `TELEGRAM_VIDEO_MAX_MB` (default 200) are refused before download; the file is downloaded to a temporary directory and removed after the call. One video is processed at a time.
 - **Profile and privacy:** get your own account info, update profile fields, set or delete profile photos, inspect privacy settings, get user info/photos/status, and manage bot commands.
 - **Folders and drafts:** list, create, update, reorder, and delete Telegram folders; preview a shared folder invite (`t.me/addlist/...`) without joining it; save, list, and clear drafts.
   - `get_folder_limits` reports current Premium-aware folder, explicit-chat and pin limits from Telegram app config; unavailable limits are `null`.
@@ -231,6 +247,34 @@ Every new message of a private chat, basic group or supergroup gets one numbered
 The debounce tools above keep their private-only behaviour.
 
 **Updates missed while offline.** After a reconnect the server asks Telegram for the updates it missed (`catch_up`), so messages received during a network outage still reach the incoming feed and the event log. Telethon's own automatic reconnect does not do this, and it fetches a difference by itself only after 15 minutes without updates. On a flaky network set `TELEGRAM_CATCH_UP_INTERVAL` (seconds, e.g. `120`, at least `30`; default `0`, off) to ask for missed updates periodically; when nothing was missed the request returns an empty difference.
+
+**MCP Events.** Supports the official MCP Events beta with `telegram.message.created` and all three delivery methods: poll, push and webhooks. Compatibility matrix for event delivery methods and MCP connection types:
+
+| Connection configuration | Poll | Push | Webhooks |
+|---|---|---|---|
+| **stdio** | Yes | Yes | Not offered |
+| **Anonymous Streamable HTTP** | Yes | Yes | Not offered |
+| **Authenticated Streamable HTTP** | Yes | Yes | Yes |
+| **Legacy SSE** | Not offered | Not offered | Not offered |
+
+The MCP Events standard requires authentication for webhook subscriptions.
+Set `TELEGRAM_MCP_HTTP_TOKEN` in the Telegram MCP server's environment; generate one with `python -c 'import secrets; print(secrets.token_urlsafe(32))'`.
+Configure the client to send the same value as `Authorization: Bearer <token>`.
+Example for Claude Code with env substitution:
+
+```json
+{
+  "mcpServers": {
+    "telegram": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp",
+      "headers": {
+        "Authorization": "Bearer ${TELEGRAM_MCP_HTTP_TOKEN}"
+      }
+    }
+  }
+}
+```
 
 ## Requirements
 
@@ -576,6 +620,10 @@ will use the server: a single long-lived process holds one Telegram
 connection, instead of every client spawning its own Telethon session —
 Telegram throttles and may flag accounts that open many parallel sessions.
 
+HTTP authentication is optional. Set `TELEGRAM_MCP_HTTP_TOKEN` in the server's
+environment and configure the client to send the same value in its
+`Authorization: Bearer <token>` header.
+
 Every tool call also has a server-side ceiling of 55 seconds, configured with
 `TELEGRAM_TOOL_TIMEOUT_SECONDS`. A timed-out Telegram request returns an explicit
 MCP error instead of leaving the client waiting indefinitely. The error says
@@ -752,11 +800,34 @@ missing MTProxy secret, or a missing `python-socks` package) cause the server
 to fail fast at startup with a clear error message instead of silently
 bypassing the proxy.
 
+## Marking Processed Messages as Read
+
+Use `mark_messages_read(chat_id, message_ids)` with a numeric chat ID and the
+IDs of processed incoming messages. The tool checks the unread history and
+refuses to advance the read marker past any earlier unread message omitted
+from the list. It preserves newer messages and manual unread marks. Forum
+topics use their own read state.
+
+Pass `dry_run=true` to verify which messages the acknowledgement would cover.
+A successful write returns the verified read marker and the unread counts
+before and after. `mark_as_read` remains available for marking an entire chat.
+
 ## File Path Security
 
 File-path and media tools (`send_file`, `edit_message_media`, `download_media`, `upload_file`, `send_voice`, `send_sticker`, `set_profile_photo`, `edit_chat_photo`, and `send_album`) are registered and supported, but remain strictly disabled by default until allowed roots are configured (safe-by-default to prevent unauthorized file access).
 
 `send_file` and `send_album` keep their existing success line and append `MessageIDs: [...]` when Telethon returns the sent messages. Album IDs follow the same order as `file_paths`; a `null` entry means Telethon could not map that position to a message ID. Pass a known ID to `edit_message_media` to replace that item.
+
+Pass `include_metadata=true` to `download_media` for a JSON result with
+`path`, `original_filename`, `size_bytes`, and `sha256`. The original filename
+comes from Telegram and is `null` for media without one. The server hashes
+the saved bytes and checks document downloads against Telegram's reported size.
+The result also includes `download_url` when remote downloads are configured.
+Without this option, the tool returns its usual text response.
+
+`download_media` respects Telegram's content protection. It refuses to save
+media from protected chats or messages, including embedded media in formatted
+posts, and refuses self-destructing attachments.
 
 Allowed roots can come from:
 
